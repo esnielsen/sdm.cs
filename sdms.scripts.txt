@@ -1,0 +1,492 @@
+RUNNING SDMS with BIOMOD2 TO GET CLIMATIC STABILITY
+
+
+LIB <- c("rgbif", "biomod2", "ggplot2", "gridExtra", "knitr", "raster", 
+         "ade4", "rworldmap", "cleangeo", "maptools", "rasterVis", "rgdal","rgeos", "sdmpredictors", "netcdf4", "usdm", "xlsx")
+#for(i in LIB) { install.packages(i, repos="http://ftp.sun.ac.za/ftp/pub/mirrors/cran.za.r/") ; library(i, character.only=T) }
+for(i in LIB) { library(i, character.only=T) }
+
+
+###################################################################################
+###############      STEP 1: Setting Env Predictor Layers   #######################
+###################################################################################
+
+
++++++++++++++ Historical Raster Layers for SDMs (From Singayarer et al. 2017)++++++++++++++++
+
+
+## Open one of the historical netcdf layers (for time point 0 in past as example)
+fname <- "~/Desktop/PhD_stuffies/netcdfs/input/tdwzaa.pdann.nc"
+nc<-nc_open(fname)
+
+#get details for each variable (names 1-3)
+ncatt_get(nc, attributes(nc$var)$names[1])
+
+# A var names: "temp_mm_1_5m" / "precip_mm_srf" / "temp_mm_srf" 
+# O var names: temp_mm_uo / salinity_mm_dpth / mixLyrDpth_mm_uo
+
+# create brick of each layer, then stack layers for either A (atmospheric) or O (oceanic). Below is example for A. 
+TAS1 <- brick(fname, varname="temp_mm_1_5m")
+TAS2 <- brick(fname, varname="precip_mm_srf")
+TAS3 <- brick(fname, varname="temp_mm_srf")
+a0 <- stack(TAS, TAS2, TAS3)
+
+##But the ocean a& atmospheric raster layers won't stack because they are different dimensions & resolutions
+##So we need to first resample one layer by the other:
+
+a<-extent(9.375, 39.375, -36.25, -21.25) ## edit to extent of a0
+o<-extent(10.625, 39.375, -37.5, -22.5) ## edit to extent of o0
+extent_list<-list(a, o)
+extent_list<-lapply(extent_list, as.matrix)
+matrix_extent<-matrix(unlist(extent_list), ncol=length(extent_list))
+rownames(matrix_extent)<-c("xmin", "ymin", "xmax", "ymax")
+best_extent<-extent(min(matrix_extent[1,]), max(matrix_extent[3,]), min(matrix_extent[2,]), max(matrix_extent[4,]))
+ranges<-apply(as.matrix(best_extent), 1, diff)
+reso<-res(o0) ##choose the layer with the resolution you want
+nrow_ncol<-ranges/reso
+s<-raster(best_extent, nrows=nrow_ncol[2], ncols=nrow_ncol[1], crs=o0@crs) ## choose the layer with the crs you want
+a0.c.r <-resample(a0, s, method="ngb") 
+o0.c.r <-resample(o0, s, method="ngb") 
+env.0=stack(a0.c.r, o0.c.r)
+
+
+++++++++++++++++++++ Contemporary Raster Layers from BioOracle  ++++++++++++++++++++
+
+## Open layers from bio-oracle with sdmpredictors
+a.contp <- load_layers( layercodes = c("WC_bio5", "WC_bio6", "WC_bio1") , equalarea=FALSE, rasterstack=TRUE)
+environment.contp <- load_layers( layercodes = c("BO2_tempmean_ss", "BO2_tempmax_ss", "BO2_chlomean_ss", "BO2_curvelmean_ss") , equalarea=FALSE, rasterstack=TRUE)
+
+# Resample atmospheric by oceanic
+a<-extent(-180, 180, -90, 90)
+o<-extent(-180, 180, -90, 90)
+extent_list<-list(a, o)
+extent_list<-lapply(extent_list, as.matrix)
+matrix_extent<-matrix(unlist(extent_list), ncol=length(extent_list))
+rownames(matrix_extent)<-c("xmin", "ymin", "xmax", "ymax")
+best_extent<-extent(min(matrix_extent[1,]), max(matrix_extent[3,]), min(matrix_extent[2,]), max(matrix_extent[4,]))
+ranges<-apply(as.matrix(best_extent), 1, diff)
+reso<-res(a.contp)
+nrow_ncol<-ranges/reso
+s2<-raster(best_extent, nrows=nrow_ncol[2], ncols=nrow_ncol[1], crs=a.contp@crs)
+a.c.r.2 <-resample(a.contp, s2, method="ngb")
+o.c.r.2 <-resample(environment.contp, s2, method="ngb")
+contemp.r.2=stack(a.c.r.2, o.c.r.2)
+
+#######################################################################################
+##################      STEP 3: Testing for multicollinearity   #######################
+#######################################################################################
+
+# Calculate variance inflation factor (VIF)
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+## Here we want to have VIF < 10, meaning our layers are uncorrelated w/ package usdm
+# First crop by the extent of the analysis
+contemp.crop <- crop(contemp.r.2, SA.sg.ext)
+# Run VIF
+vif(contemp.crop)
+# Remove layers which are correlated
+VARSEL <- c("WC_bio5", "BO2_tempmax_ss", "BO2_curvelmean_ss", "BO2_chlomean_ss")
+contemp.4p <- stack(subset(contemp.crop, VARSEL))
+# Re-run VIF to confirm no correlation 
+vif(contemp.4p)
+
+
+# Principal Component Analysis.
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# import excel presence sheet, all as numeric. This is our xy coordinates, followed by 1 to state presence. 
+library(readxl)
+Crabs_xy <- read_excel("~/Desktop/PhD_stuffies/SDMS/Crabs_xy.xlsx", 
+                       col_types = c("numeric", "numeric"))
+View(Crabs_xy)
+
+# plot presence points on a map, here using max temp as example
+plot(contemp.4p$WC_bio5)
+points(Crabs_xy[,1:2], pch=19, col="red")
+
+# Extract bioclim values for our species locations:
+envdata <- extract(x=contemp.4p, y=cbind(Crabs_xy$x, Crabs_xy$y))
+
+#adding environmental collumns to xy coordinates 
+data<- cbind2 (x=Crabs_xy, y=envdata)
+
+# The `dudi.pca` function allows to perform the PCA over the whole study area.
+#this requires library(ade4)
+# We decide to keep only 2 principal component axes to summarize the whole environmental niche.
+pca1 <- dudi.pca(envdata, scannf = F, nf = 2)
+round(pca1$eig/sum(pca1$eig)*100, 2)
+
+# A preliminary test is to look for potential outliers in the environmental data.
+plot(pca1$li[,1:2]) # PCA scores on first two axes
+summary(pca1$li)
+
+#plot a correlation circle
+s.corcircle(pca1$co)
+
+# calculate Pearson/Spearman correlations between pairs of variables 
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+( cor_current <- cor(envdata, method="spearman") )
+
+# reformat correlation table for graphical analyse
+#here you require the package reshape
+cor_current[ upper.tri(cor_current, diag = T) ] <- NA
+cor_current_resh <- na.omit( melt( cor_current) )
+colnames(cor_current_resh) <- c("var1", "var2", "correlation")
+
+# only consider absolute value of correlations
+cor_current_resh$correlation <- abs(cor_current_resh$correlation)
+cor_current_resh[order(cor_current_resh$correlation),]
+
+# make a correlation plot
+gg_cor <- ggplot(cor_current_resh, aes(x = var1, y = var2 , fill = correlation) )
+gg_cor + geom_tile() + xlab("") + ylab("") + theme(axis.text.x = element_text(angle=90, vjust=0.5))
+
+# # Save everything we have done so far:
+save.image(file=paste(SDM1, "MyRwork.RData", sep="_"))
+
+########################################################################
+##################     STEP 3: biomod modelling      ###################
+########################################################################
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Individual model details
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+#  - 3 sets of 500 random pseudo absences 
+#  - 4 models algorithms : General Linear model ('GLM'), Generalized Additive Model ('GAM'),
+#    Generalized Boosted Model ('GBM'), and Random Forest ('RF') ---You could choose others.
+#  - 3 fold cross validation will be carried out for each model: Models will be calibrated 
+#    on 70% of the data, and evaluated on the remaining 30%. 
+#    This procedure will be repeated 3 times. 
+#  - models will be evaluated with the True Skill Score statistic ('TSS') and the Area Under ROC Curve ('ROC')
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+# Set up non-default options:
+# ...............................................
+# Default parameters be suffiecient for most common SDM modeling, but you can fine-tune parameters
+# of each algorithm. Eg. We will run a GLM with quadratic terms and first order interactions,
+# limit the number of GBM trees to 1000 and use the 'mgcv' package for the GAM algorithm.
+# Refer to documentation for further details.
+
+MySpc_options <- BIOMOD_ModelingOptions(
+  GLM = list( type = 'quadratic', interaction.level = 1 ),
+  GBM = list( n.trees = 1000 ),
+  GAM = list( algo = 'GAM_mgcv' ) )
+
+# As no independant dataset is available to evaluate the models, a repeated data spliting procedure
+# (cross-validation) will be carried out --models are calibrated on 80% of the data and evaluated 
+# on the remaining 20%--
+# This entire procedure is repeated 4 times (NbRunEval). 
+
+# By default, each model will be evaluated according to `TSS` and `ROC` curve metrics.
+# Other metrics are available in biomod2 and can be seen under the documentation. 
+
+# This step may take a while so wait until the ">" symbol appears again before continuing.
+MySpc_models <- BIOMOD_Modeling( data = SPC_PresAbs,
+                                 models = c("GLM", "GAM", "GBM", "RF"),
+                                 models.options = MySpc_options,
+                                 NbRunEval = 4,
+                                 DataSplit = 80,
+                                 VarImport = 3,
+                                 models.eval.meth=c('TSS','ROC'),
+                                 do.full.models = F,
+                                 modeling.id = SDM1 )
+
+# 48 models are built and evaluated:4 algorithms*4 cross validations*3 pseudo-absences samplings
+
+# # Save everything we have done so far:
+save.image(file=paste(SDM1, "MyRwork.RData", sep="_"))
+
+########################################################################
+##################        STEP 4:model eval          ###################
+########################################################################
+
+# get models evaluation scores
+MyModels_scores <- get_evaluations(MySpc_models)
+
+## MyModels_scores is a 5 dimension array containing the scores of the models
+dim(MyModels_scores)
+dimnames(MyModels_scores)
+
+# We can also visualise the influence of different aspects of the models (e.g choice of the 
+# algorithm, cross validation run, pseudo absences sampling) according to the evaluation metrics.
+# On these graphs, the points represent the mean of evaluation score for a given condition 
+# and lines represents associated standard deviations.
+
+models_scores_graph(MySpc_models, by = "models" , metrics = c("ROC","TSS"), xlim = c(0.5,1), ylim = c(0.5,1))
+models_scores_graph(MySpc_models, by = "cv_run" , metrics = c("ROC","TSS"), xlim = c(0.5,1), ylim = c(0.5,1))
+models_scores_graph(MySpc_models, by = "data_set" , metrics = c("ROC","TSS"), xlim = c(0.5,1), ylim = c(0.5,1))
+
+# The predictive accuracy of the models are good when the AUC (area under the curve- here ROC) 
+# > 0.8 and TSS > 0.65.`RF`/ 'GLM' models seems to be the most accurate ones on average,
+# followed by `GBM`then `GAM` 
+# You can also view scores numerically...
+
+MyModels_scores["ROC","Testing.data",,,]
+MyModels_scores["TSS","Testing.data",,,]
+
+# Variable importance
+# The higher a score is, the more important is the variable. We will visualize this as a barplot
+
+MyModels_var_import <- get_variables_importance(MySpc_models)
+MyModels_var_import
+dimnames(MyModels_var_import)
+
+# average variable importance by algorithm
+mVarImp <- apply(MyModels_var_import, c(1,2), median) 
+mVarImp <- apply(mVarImp, 2, function(x) x*(1/sum(x))) # standardize the data
+mVarImp 
+#visualize this as a bar plot
+VarImpBarPlot <- barplot(mVarImp, legend.text=row.names(mVarImp), xlim=c(0,7))
+
+
+# Response curves
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# To analyze how each environmental variable influences modelled probability of species presence,
+# we will use an evaluation procedure proposed by Elith et al.(2005). 
+
+#A plot of these predictions allows visualisation of the modeled response(y-axis) 
+# to the given variable (x-axis),conditional to the other variables being held constant.
+
+# We have first to name and load the produced models.
+MySpc_glm <- BIOMOD_LoadModels(MySpc_models, models='GLM')
+MySpc_gam <- BIOMOD_LoadModels(MySpc_models, models='GAM')
+MySpc_gbm <- BIOMOD_LoadModels(MySpc_models, models='GBM')
+MySpc_rf  <- BIOMOD_LoadModels(MySpc_models, models='RF')
+
+glm_eval_strip <- biomod2::response.plot2(
+  models  = MySpc_glm, Data = get_formal_data(MySpc_models,'expl.var'), 
+  show.variables= get_formal_data(MySpc_models,'expl.var.names'),
+  do.bivariate = FALSE, fixed.var.metric = 'median', legend = FALSE,
+  display_title = FALSE, data_species = get_formal_data(MySpc_models,'resp.var'))
+
+gam_eval_strip <- biomod2::response.plot2(
+  models  = MySpc_gam, Data = get_formal_data(MySpc_models,'expl.var'), 
+  show.variables= get_formal_data(MySpc_models,'expl.var.names'),
+  do.bivariate = FALSE, fixed.var.metric = 'median', legend = FALSE,
+  display_title = FALSE, data_species = get_formal_data(MySpc_models,'resp.var'))
+
+gbm_eval_strip <- biomod2::response.plot2(
+  models  = MySpc_gbm, Data = get_formal_data(MySpc_models,'expl.var'), 
+  show.variables= get_formal_data(MySpc_models,'expl.var.names'),
+  do.bivariate = FALSE, fixed.var.metric = 'median', legend = FALSE,
+  display_title = FALSE, data_species = get_formal_data(MySpc_models,'resp.var'))
+
+rf_eval_strip <- biomod2::response.plot2(
+  models  = MySpc_rf, Data = get_formal_data(MySpc_models,'expl.var'), 
+  show.variables= get_formal_data(MySpc_models,'expl.var.names'),
+  do.bivariate = FALSE, fixed.var.metric = 'median', legend = FALSE,
+  display_title = FALSE, data_species = get_formal_data(MySpc_models,'resp.var'))
+
+# Map model prediction on the current climate
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+MySpc_models_proj_current <- BIOMOD_Projection( modeling.output = MySpc_models,
+                                                new.env = contemp.4p,
+                                                proj.name = "current",
+                                                binary.meth = "ROC",
+                                                output.format = ".img",
+                                                do.stack = FALSE )
+
+#A list of all the models that were just executed
+MySpc_models_proj_current
+
+# Plot and compare the maps for the potential current distribution projected by the different 
+# models.
+plot(MySpc_models_proj_current,  str.grep="PA1_RUN1")
+
+# # Save everything we have done so fare:
+# # ...............................................
+save.image(file=paste(SDM1, "MyRwork.RData", sep="_"))
+
+########################################################################
+##################   STEP 5:ensemble modelling       ###################
+########################################################################
+
+#run ensemble models
+MySpc_ensemble_models <- BIOMOD_EnsembleModeling( modeling.output = MySpc_models,
+                                                  chosen.models ='all',
+                                                  em.by = 'all',  #combine all models
+                                                  eval.metric = 'all',
+                                                  eval.metric.quality.threshold = c(0.7,0.8),
+                                                  models.eval.meth = c('TSS','ROC'),
+                                                  prob.mean = FALSE,
+                                                  prob.cv = TRUE, #coefficient of variation across predictions
+                                                  committee.averaging = TRUE,
+                                                  prob.mean.weight = TRUE,
+                                                  VarImport = 0 )
+
+#check scores
+MySpc_ensemble_models_scores <- get_evaluations(MySpc_ensemble_models)
+MySpc_ensemble_models_scores
+
+# Ensemble model forecasts
+# ...............................................
+MySpc_ensemble_models_proj_current <- BIOMOD_EnsembleForecasting( 
+  EM.output = MySpc_ensemble_models,
+  projection.output = MySpc_models_proj_current,
+  binary.meth = "ROC",  #make binary predictions (pres/abs) based on ROC score
+  output.format = ".img",
+  do.stack = FALSE )
+
+# The projections for current conditions are stored in the 'proj_current' directory. 
+list.files(paste(SDM1, "/proj_current/individual_projections", sep=""))
+get_projected_models(MySpc_ensemble_models_proj_current)
+
+#Plot them all--- this may take a while---
+plot(MySpc_ensemble_models_proj_current)
+plot(MySpc_ensemble_models_proj_current, str.grep="EMcaByTSS")
+plot(MySpc_ensemble_models_proj_current, str.grep="EMwmeanByTSS")
+
+# # Save everything we have done so fare:
+# # ...............................................
+save.image(file=paste(SDM1, "MyRwork.RData", sep="_"))
+
+########################################################################
+########### STEP 6:model projection with past conditions ###############
+########################################################################
+
+#load layer for 1,000 years back. Do this section for each time step.
+env.1 <- 'env.1.tif'
+env.1=stack(env.1)
+plot(env.1)
+
+# Run the projections
+# ...............................................
+MySpc_models_proj_1 <- BIOMOD_Projection( modeling.output = MySpc_models,
+                                             new.env = env.1,
+                                             proj.name = "1kya",
+                                             binary.meth = c("ROC"),
+                                             output.format = ".img",
+                                             do.stack = FALSE)
+
+#this gave error because layer names are not the same betwn env0 and env1 rasterstacks
+# to change layer names of env1:
+names(env.1) <- c('env.0.1','env.0.2','env.0.3', 'env.0.4')
+
+MySpc_ensemble_models_proj_1 <- BIOMOD_EnsembleForecasting( 
+  EM.output = MySpc_ensemble_models,
+  projection.output = MySpc_models_proj_1,
+  binary.meth = "ROC",
+  output.format = ".img",
+  do.stack = FALSE,
+  build.clamping.mask=F)
+
+########################################################################
+########### STEP 7:Calculate climatic stability ########################
+########################################################################
+
+
+# upload all outputs & stack
+
+
+MyBinCA_1 <- raster::stack("Pangulosus/proj_1kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_2 <- raster::stack("Pangulosus/proj_2kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_3 <- raster::stack("Pangulosus/proj_3kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_4 <- raster::stack("Pangulosus/proj_4kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_5 <- raster::stack("Pangulosus/proj_5kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_6 <- raster::stack("Pangulosus/proj_6kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_7 <- raster::stack("Pangulosus/proj_7kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_8 <- raster::stack("Pangulosus/proj_8kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_9 <- raster::stack("Pangulosus/proj_8kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_10 <- raster::stack("Pangulosus/proj_10kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_11 <- raster::stack("Pangulosus/proj_11kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_12 <- raster::stack("Pangulosus/proj_12kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_13 <- raster::stack("Pangulosus/proj_13kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_14 <- raster::stack("Pangulosus/proj_14kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_15 <- raster::stack("Pangulosus/proj_15kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_16 <- raster::stack("Pangulosus/proj_16kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_17 <- raster::stack("Pangulosus/proj_17kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_18 <- raster::stack("Pangulosus/proj_18kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_19 <- raster::stack("Pangulosus/proj_19kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_20 <- raster::stack("Pangulosus/proj_20kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+MyBinCA_21 <- raster::stack("Pangulosus/proj_21kya/individual_projections/Pangulosus_EMcaByTSS_mergedAlgo_mergedRun_mergedData.img")
+
+s <- raster::stack(MyBinCA_1, MyBinCA_2, MyBinCA_3, MyBinCA_4, MyBinCA_5, MyBinCA_6, MyBinCA_7, MyBinCA_8, MyBinCA_9, MyBinCA_10, MyBinCA_11, MyBinCA_12, MyBinCA_13, MyBinCA_14, MyBinCA_15, MyBinCA_16, MyBinCA_17, MyBinCA_18, MyBinCA_19, MyBinCA_20, MyBinCA_21)
+
+## run the sum function on the raster stack - i.e. add (non-cumulatively) the rasters together
+## This is the climatic stability over the 21 kya
+r <- sum(s)
+
+#write the output raster to file
+r <- writeRaster(r, filename = "./Path/For/Export/Filename", format="GTiff", overwrite=TRUE)
+
+## calculate standard deviation and median of stack ##
+
+rasterstack_meansd_fast <- function(x) {
+  s0 <- nlayers(x)
+  s1 <- raster(x, layer=1)
+  s2 <- s1^2
+  for(ri in 2:s0) {
+    r <- raster(x, layer=ri)
+    s1 <- s1 + r
+    s2 <- s2 + r^2
+  }
+  list(mean=s1/s0, sd=sqrt((s0 * s2 - s1 * s1)/(s0 * (s0 - 1))))
+}
+
+sd <- rasterstack_meansd_fast(s)
+plot(sd$mean)
+plot(sd$sd)
+
+# Extract climatic stability for sample locations:
+envdata <- extract(x=r, y=cbind(sample_xy$X, xy$Y))
+
+################################################################################################
+########### STEP 8:Correlation between clim stability and gen diversity ########################
+################################################################################################
+
+## RUNNING GLMS ##
+library(broom)
+
+## Set up linear models ##
+null <- glm(hap ~ 1, cp_mt_models, family='gaussian')
+m1 <- glm(hap ~ clim.stab, cp_mt_models, family='gaussian')
+m2 <- glm(hap ~ dist.120, cp_mt_models, family = 'gaussian')
+m3 <- glm(hap ~ mid.dist, cp_mt_models, family = 'gaussian')
+m4 <- glm(hap ~ factor(cluster), cp_mt_models, family = 'gaussian')
+m5 <- glm(hap ~ clim.stab + dist.120, cp_mt_models, family = 'gaussian')
+m6 <- glm(hap ~ clim.stab + mid.dist, cp_mt_models, family = 'gaussian')
+m7 <- glm(hap ~ clim.stab + factor(cluster), cp_mt_models, family = 'gaussian')
+m8 <- glm(hap ~ clim.stab + dist.120 + mid.dist, cp_mt_models, family = 'gaussian')
+m9 <- glm(hap ~ clim.stab + dist.120 + factor(cluster), cp_mt_models, family = 'gaussian')
+m10 <- glm(hap ~ clim.stab + mid.dist + factor(cluster), cp_mt_models, family = 'gaussian')
+m11 <- glm(hap ~ mid.dist + factor(cluster), cp_mt_models, family = 'gaussian')
+m12 <- glm(hap ~ mid.dist + dist.120, cp_mt_models, family = 'gaussian')
+m13 <- glm(hap ~ mid.dist + dist.120 + factor(cluster), cp_mt_models, family = 'gaussian')
+m14 <- glm(hap ~ dist.120 + factor(cluster), cp_mt_models, family = 'gaussian')
+m15 <- glm(hap ~ clim.stab + dist.120 + mid.dist + factor(cluster), cp_mt_models, family = 'gaussian')
+
+## Compare models ##
+umm.table <- do.call(rbind, lapply(list(null, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15), broom::glance))
+
+table.cols <- c("df.residual", "deviance", "AIC")
+reported.table <- summ.table[table.cols]
+names(reported.table) <- c("Resid. Df", "Resid. Dev", "AIC")
+
+reported.table[['dAIC']] <-  with(reported.table, AIC - min(AIC))
+reported.table[['weight']] <- with(reported.table, exp(- 0.5 * dAIC) / sum(exp(- 0.5 * dAIC)))
+reported.table$AIC <- NULL
+reported.table$weight <- round(reported.table$weight, 2)
+reported.table$dAIC <- round(reported.table$dAIC, 1)
+
+reported.table
+
+## summary metrics of relationship ##
+
+lm.h = lm(hap~clim.stab, data=cp_gen_clim)
+summary(lm.h)
+
+##plot linear relationship w/ gpplot ##
+
+h <- ggplot(CP_climatic_stability, aes(x=climstab, y=nucdiv, size=n))+
+  geom_point()+
+  geom_smooth(method=lm, se=TRUE)+
+  labs(x = "Climatic stability", y = "Nucleotide diversity")+
+  scale_size_continuous(range = c(4, 9))
+
+h+theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=16))
